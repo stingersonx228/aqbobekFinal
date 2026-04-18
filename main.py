@@ -10,25 +10,29 @@ import os
 import logging
 import uuid
 import json
+import re
 
+# Load env BEFORE local imports
 load_dotenv()
 
 from src.database import engine, Base, get_db, AsyncSessionLocal
-from src.models import IncidentRecord, CanteenRecord, TaskRecord
+from src.models import IncidentRecord, CanteenRecord, TaskRecord, ServiceRequest
 from src.schemas import NutritionReportResponse, AbsentDetails, IncidentsResponse, IncidentDetail, TasksResponse, TaskDetail
-from src.ai_service import extract_with_gemini
+from src.ai_service import extract_with_ai
 from src.whatsapp_service import send_whatsapp_message
 from src.export_service import generate_excel_report
+from src.scheduler_service import scheduler
+from src.notification_service import send_unified_reply, notify_all_platforms
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Aqbobek WhatsApp Server")
+app = FastAPI(title="Aqbobek Lyceum AI OS")
 
-# --- CORS Configuration for Frontend Integration ---
+# --- CORS ---
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], # Allow all for hackathon
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -60,135 +64,119 @@ manager = ConnectionManager()
 async def startup_event():
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+    logger.info("✅ Aqbobek OS Initialized.")
 
 @app.get("/")
 def read_root():
-    return {"status": "Aqbobek WhatsApp Python Backend is running"}
+    return {"status": "Aqbobek AI OS is running"}
 
-# --- WebSocket Endpoint ---
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     await manager.connect(websocket)
     try:
         while True:
-            await websocket.receive_text() # Keep connection alive
+            await websocket.receive_text()
     except WebSocketDisconnect:
         manager.disconnect(websocket)
 
-# --- REST API Endpoints for Frontend Dashboard ---
+# --- API Endpoints ---
 
-@app.get("/api/v1/nutrition/today", response_model=NutritionReportResponse)
+@app.get("/api/v1/nutrition/today")
 async def get_nutrition_today(db: AsyncSession = Depends(get_db)):
-    """API endpoint for Frontend Dashboard to get today's attendance stats"""
-    # In a real app, filter by today's date using SQLAlchemy.
-    # For hackathon simplicity, we aggregate all records.
     result = await db.execute(select(
         func.sum(CanteenRecord.sick_students).label('total_sick'),
         func.sum(CanteenRecord.competition_students).label('total_comp'),
         func.count(CanteenRecord.id).label('messages_count')
     ))
     row = result.fetchone()
-    
-    sick = row.total_sick or 0
-    comp = row.total_comp or 0
-    parsed_msgs = row.messages_count or 0
+    return {
+        "date": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+        "totalVseobuch": 400,
+        "absentDetails": {"sick_count": row.total_sick or 0, "competition_count": row.total_comp or 0},
+        "rawMessagesParsed": row.messages_count or 0
+    }
 
-    return NutritionReportResponse(
-        date=datetime.now(timezone.utc).strftime("%Y-%m-%d"),
-        totalVseobuch=400, # Mock total students
-        absentDetails=AbsentDetails(sick_count=sick, competition_count=comp),
-        rawMessagesParsed=parsed_msgs,
-        status="success"
-    )
-
-@app.get("/api/v1/incidents/active", response_model=IncidentsResponse)
+@app.get("/api/v1/incidents/active")
 async def get_active_incidents(db: AsyncSession = Depends(get_db)):
-    """API endpoint for Frontend Dashboard to get open incidents"""
-    result = await db.execute(select(IncidentRecord).where(IncidentRecord.status == "open"))
+    result = await db.execute(select(IncidentRecord).order_by(IncidentRecord.created_at.desc()))
     incidents = result.scalars().all()
+    return {"incidents": [inc.issue for inc in incidents]}
+
+@app.get("/api/v1/schedule/substitution")
+async def get_latest_substitution(teacher: str, day: str = "Дүйсенбі"):
+    return scheduler.find_replacement(teacher, day)
+
+# --- KILLER FEATURE: Command Processing ---
+
+async def handle_commands(from_number: str, text: str) -> bool:
+    cmd = text.strip().lower()
     
-    return IncidentsResponse(
-        incidents=[
-            IncidentDetail(
-                id=inc.incident_id or f"inc-{inc.id}",
-                timestamp=inc.created_at.strftime("%Y-%m-%dT%H:%M:%SZ") if inc.created_at else "",
-                location=inc.location,
-                description=inc.issue,
-                reporter=inc.reported_by or "Неизвестный",
-                assignedTo=inc.assigned_to or "Завхоз",
-                status=inc.status
-            ) for inc in incidents
-        ]
-    )
+    if cmd.startswith("/free"):
+        # Example: /free 09:05-09:50
+        parts = text.split(" ", 1)
+        time_slot = parts[1] if len(parts) > 1 else "08:00-08:45"
+        free = scheduler.find_free_teachers("Дүйсенбі", time_slot)
+        
+        reply = f"🟢 Свободные учителя ({time_slot}):\n"
+        for t in free[:10]:
+            reply += f"- {t['name']}\n"
+        await send_unified_reply(from_number, reply)
+        return True
+        
+    if cmd == "/report":
+        await send_unified_reply(from_number, "⏳ Генерирую Excel-отчет...")
+        async with AsyncSessionLocal() as db:
+            filepath = await generate_excel_report(db)
+        await send_unified_reply(from_number, f"📊 Отчет готов! Путь: {filepath}")
+        return True
+        
+    return False
 
-@app.get("/api/v1/tasks/active", response_model=TasksResponse)
-async def get_active_tasks(db: AsyncSession = Depends(get_db)):
-    """Bonus endpoint for Tasks"""
-    result = await db.execute(select(TaskRecord).where(TaskRecord.status == "pending"))
-    tasks = result.scalars().all()
-    
-    return TasksResponse(
-        tasks=[
-            TaskDetail(
-                id=t.id,
-                assignee=t.assignee,
-                action=t.action,
-                status=t.status,
-                timestamp=t.created_at.strftime("%Y-%m-%dT%H:%M:%SZ") if t.created_at else ""
-            ) for t in tasks
-        ]
-    )
-
-
-# --- WhatsApp Webhook Processing ---
+# --- Main Logic ---
 
 async def process_whatsapp_message(message_data: dict):
-    """Background task to process the message from Node.js Bridge"""
     try:
-        from src.database import AsyncSessionLocal
-        
         from_number = message_data.get("from")
         text_body = message_data.get("body", "")
-        
-        if not text_body:
+        if not text_body: return
+
+        # 1. Handle Commands
+        if await handle_commands(from_number, text_body):
             return
 
-        logger.info(f"Received message from {from_number}: {text_body}")
-
-        # Check for commands
-        if text_body.strip().lower() == "/report":
-            await send_whatsapp_message(from_number, "Generating report, please wait...")
-            async with AsyncSessionLocal() as db:
-                filepath = await generate_excel_report(db)
-            
-            await send_whatsapp_message(from_number, f"Report generated successfully on server. Path: {filepath}")
-            return
-
-        # 1. AI Extraction
-        parsed_data = await extract_with_gemini(text_body)
+        # 2. AI Extraction
+        parsed_data = await extract_with_ai(text_body)
         data_type = parsed_data.get("type")
-        
-        reply_text = "I couldn't understand that. Please report canteen attendance, incidents, or tasks."
         broadcast_event = None
 
-        # 2. Database Save & Format Reply
         async with AsyncSessionLocal() as db:
-            if data_type == "incident":
-                new_incident = IncidentRecord(
-                    incident_id=f"inc-{uuid.uuid4().hex[:6]}",
+            if data_type in ["it_support", "maintenance", "logistics", "emergency"]:
+                desc = parsed_data.get("issue") or parsed_data.get("description") or parsed_data.get("item")
+                priority = parsed_data.get("priority", "medium")
+                
+                new_request = ServiceRequest(
+                    category=data_type,
                     location=parsed_data.get("location", "unknown"),
-                    issue=parsed_data.get("issue", "unknown"),
-                    reported_by=parsed_data.get("reporter", from_number),
-                    assigned_to=parsed_data.get("assignedTo", "Завхоз")
+                    description=desc,
+                    priority=priority
                 )
-                db.add(new_incident)
+                db.add(new_request)
                 await db.commit()
-                reply_text = f"Зафиксирован инцидент:\nЛокация: {new_incident.location}\nПроблема: {new_incident.issue}\nОтправлено завхозу."
-                broadcast_event = {"type": "NEW_INCIDENT"}
                 
-                # ОТВЕЧАЕМ ТОЛЬКО НА ИНЦИДЕНТЫ
-                await send_whatsapp_message(from_number, reply_text)
+                # KILLER FEATURE: Emergency Multi-Platform Broadcast
+                if data_type == "emergency":
+                    await notify_all_platforms(f"ВНИМАНИЕ! {desc} в {new_request.location}", priority="CRITICAL")
                 
+                # Reply
+                replies = {
+                    "it_support": f"⚙️ IT-служба уведомлена: {desc}.",
+                    "emergency": f"🚨 СИГНАЛ ТРЕВОГИ ПРИНЯТ! Помощь направлена в {new_request.location}.",
+                    "logistics": f"📦 Запрос на логистику ({desc}) принят.",
+                    "maintenance": f"🛠 Заявка на ремонт ({desc}) создана."
+                }
+                await send_unified_reply(from_number, replies.get(data_type, "Заявка принята."))
+                broadcast_event = {"type": "NEW_SERVICE_REQUEST", "category": data_type}
+
             elif data_type == "canteen":
                 new_record = CanteenRecord(
                     class_name=parsed_data.get("class", "school"),
@@ -198,34 +186,29 @@ async def process_whatsapp_message(message_data: dict):
                 )
                 db.add(new_record)
                 await db.commit()
-                # reply_text = f"[CANTEEN SAVED] {new_record.sick_students} sick, {new_record.competition_students} on competition."
                 broadcast_event = {"type": "NUTRITION_UPDATED"}
-                
-            elif data_type == "task":
-                new_task = TaskRecord(
-                    assignee=parsed_data.get("assignee", "unknown"),
-                    action=parsed_data.get("action", "unknown")
-                )
-                db.add(new_task)
-                await db.commit()
-                # reply_text = f"[TASK CREATED] For: {new_task.assignee}"
-                broadcast_event = {"type": "NEW_TASK"}
 
-        # 4. WebSockets: Broadcast event to frontend dashboard so they refresh data!
+            elif data_type == "substitution":
+                teacher_name = parsed_data.get("teacher_name")
+                sub_results = scheduler.find_replacement(teacher_name, "Дүйсенбі")
+                
+                if "replacements" in sub_results:
+                    reply = f"🚨 Учитель {sub_results['sick_teacher']} отсутствует.\n"
+                    for rep in sub_results["replacements"]:
+                        reply += f"\n📖 {rep['original_lesson']}\n"
+                        if rep["candidates"]:
+                            reply += f"✅ Замена: {rep['candidates'][0]['name']}\n"
+                    await send_unified_reply(from_number, reply)
+                    broadcast_event = {"type": "SUBSTITUTION_FOUND", "data": sub_results}
+
         if broadcast_event:
             await manager.broadcast(broadcast_event)
 
     except Exception as e:
-        logger.error(f"Error processing message: {e}")
+        logger.error(f"Error: {e}")
 
 @app.post("/internal-webhook")
 async def internal_webhook_handler(request: Request, background_tasks: BackgroundTasks):
-    """Receive messages from our local Node.js whatsapp-web.js bridge"""
     data = await request.json()
-    
-    try:
-        background_tasks.add_task(process_whatsapp_message, data)
-        return JSONResponse(content={"status": "received"}, status_code=200)
-    except Exception as e:
-        logger.error(f"Webhook error: {e}")
-        return JSONResponse(content={"status": "error"}, status_code=500)
+    background_tasks.add_task(process_whatsapp_message, data)
+    return JSONResponse(content={"status": "received"})

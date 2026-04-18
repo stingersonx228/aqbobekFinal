@@ -9,3 +9,5 @@ pydantic
 pydantic-settings
 pandas
 openpyxl
+pymupdf
+pyTelegramBotAPI

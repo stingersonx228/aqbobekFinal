@@ -29,3 +29,14 @@ class TaskRecord(Base):
     action = Column(String)
     status = Column(String, default="pending") # pending, done
     created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+class ServiceRequest(Base):
+    """Unified table for IT, Logistics, Emergency and Maintenance"""
+    __tablename__ = "service_requests"
+    id = Column(Integer, primary_key=True, index=True)
+    category = Column(String, index=True) # it_support, logistics, emergency, maintenance
+    location = Column(String, index=True)
+    description = Column(String)
+    priority = Column(String, default="medium")
+    status = Column(String, default="open")
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
