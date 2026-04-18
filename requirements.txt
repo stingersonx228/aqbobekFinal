@@ -1,0 +1,11 @@
+fastapi
+uvicorn
+sqlalchemy
+aiosqlite
+groq
+httpx
+python-dotenv
+pydantic
+pydantic-settings
+pandas
+openpyxl
