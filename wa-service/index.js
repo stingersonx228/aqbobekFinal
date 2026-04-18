@@ -1,3 +1,5 @@
+const path = require('path');
+require('dotenv').config({ path: path.join(__dirname, '../.env') });
 const { Client, LocalAuth } = require('whatsapp-web.js');
 const qrcode = require('qrcode');
 const express = require('express');
@@ -7,76 +9,91 @@ const fs = require('fs');
 const app = express();
 app.use(express.json());
 
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.WA_PORT || 3000;
 const PYTHON_BACKEND_URL = process.env.PYTHON_BACKEND_URL || 'http://127.0.0.1:8001/internal-webhook';
+const INTERNAL_SECRET = process.env.INTERNAL_SECRET_TOKEN;
 
-// Initialize WhatsApp Client with Local Session (persists login)
 const client = new Client({
     authStrategy: new LocalAuth(),
     puppeteer: {
-        args: ['--no-sandbox']
+        headless: true,
+        args: ['--no-sandbox', '--disable-setuid-sandbox']
     }
 });
 
-// Event: Generate QR Code
+// Event: Generate QR Code and save to PNG
 client.on('qr', (qr) => {
-    console.log('QR Code received. Saving to qr.png...');
-    qrcode.toFile('../qr.png', qr, {
+    console.log('--- NEW QR CODE GENERATED ---');
+    const qrPath = path.join(__dirname, '../qr.png');
+    
+    qrcode.toFile(qrPath, qr, {
+        width: 600, // Делаем картинку большой и четкой
+        margin: 2,
         color: {
             dark: '#000000',
             light: '#FFFFFF'
         }
     }, function (err) {
-        if (err) throw err;
-        console.log('QR code saved as qr.png in the project root. Please open it and scan.');
+        if (err) {
+            console.error('Failed to save QR code:', err);
+        } else {
+            console.log('✅ Fresh QR code saved to qr.png. OPEN IT AND SCAN!');
+        }
     });
 });
 
-// Event: Authenticated
 client.on('ready', () => {
-    console.log('WhatsApp Client is Ready!');
+    console.log('✅ WhatsApp Client is Ready!');
+    // Удаляем файл после успешного входа, чтобы не путаться
+    const qrPath = path.join(__dirname, '../qr.png');
+    if (fs.existsSync(qrPath)) fs.unlinkSync(qrPath);
 });
 
-// Event: Receive Message
 client.on('message', async (message) => {
-    // Игнорируем статусы (Истории WhatsApp)
-    if (message.from === 'status@broadcast' || message.isStatus) {
-        return;
-    }
-
-    console.log(`Received message from ${message.from}: ${message.body}`);
+    if (message.from === 'status@broadcast' || message.isStatus) return;
     
+    console.log(`📩 Received from ${message.from}: ${message.body}`);
     try {
-        // Send message to Python Backend
+        let media_data = null;
+        let media_mimetype = null;
+        
+        if (message.hasMedia) {
+            const media = await message.downloadMedia();
+            if (media && media.mimetype && media.mimetype.startsWith('audio/')) {
+                console.log(`🎤 Received Voice Message from ${message.from}`);
+                media_data = media.data; // Base64 string
+                media_mimetype = media.mimetype;
+            }
+        }
+
         await axios.post(PYTHON_BACKEND_URL, {
+            message_id: message.id._serialized, // SEND UNIQUE ID
             from: message.from,
             body: message.body,
-            isGroupMsg: message.isGroupMsg
+            user_name: message._data.notifyName || message.from,
+            platform: "whatsapp",
+            audio_base64: media_data,
+            audio_mimetype: media_mimetype
+        }, {
+            headers: { 'X-Internal-Token': INTERNAL_SECRET }
         });
     } catch (error) {
-        console.error('Error sending message to Python backend:', error.message);
+        console.error('❌ Backend error:', error.message);
     }
 });
 
 client.initialize();
 
-// Express API to allow Python to send messages
 app.post('/send', async (req, res) => {
     const { to, text } = req.body;
-    
-    if (!to || !text) {
-        return res.status(400).json({ error: 'Missing "to" or "text"' });
-    }
-
     try {
         await client.sendMessage(to, text);
         res.json({ status: 'sent' });
     } catch (error) {
-        console.error('Error sending WhatsApp message:', error);
-        res.status(500).json({ error: 'Failed to send message' });
+        res.status(500).json({ error: 'Failed to send' });
     }
 });
 
 app.listen(PORT, () => {
-    console.log(`WhatsApp Bridge Server running on port ${PORT}`);
+    console.log(`🚀 WhatsApp Bridge running on port ${PORT}`);
 });

@@ -1,71 +1,93 @@
 from groq import AsyncGroq
 import json
-import re
 import os
 import logging
+import base64
+import tempfile
 
 logger = logging.getLogger(__name__)
 
-GROQ_KEY = os.getenv("GROQ_KEY", "YOUR_GROQ_KEY")
+GROQ_KEY = os.getenv("GROQ_KEY")
 client = AsyncGroq(api_key=GROQ_KEY)
 
 SYSTEM_PROMPT = """You are the Senior AI Orchestrator for 'Aqbobek Lyceum'.
-Your task is to parse unstructured messages from staff and route them to the correct department.
+Parse staff messages and return ONLY a valid flat JSON object.
 
-Return ONLY a valid JSON object. No markdown, no text.
+CRITICAL RULES:
+1. ALWAYS include "type" as a TOP-LEVEL field.
+2. NEVER nest fields inside a category key.
+3. No markdown, no code blocks, just raw JSON.
+4. ALWAYS extract text values in the ORIGINAL LANGUAGE of the message (Russian/Kazakh). DO NOT translate words like "сломался" to "broken".
 
-CATEGORIES & FIELDS:
+CORRECT example: {"type": "canteen", "class": "10A", "total": 25, "sick": 2, "competition": 0, "sender_role": "Teacher", "is_important": false}
+WRONG example:   {"canteen": {"class": "10A", ...}}  <-- NEVER do this!
 
-1. canteen (Attendance)
-   - class: string (e.g., "10A", "7C")
-   - total: number
-   - sick: number
-   - competition: number
+TYPES AND THEIR FIELDS:
 
-2. substitution (Teacher Absence)
-   - teacher_name: string
-   - day: string
+type: "canteen" - when teacher reports class attendance
+  - class (string): class name e.g. "10A", "7B"
+  - total (number): total students
+  - sick (number): sick students
+  - competition (number): students at competitions
 
-3. maintenance (Facilities/Repairs)
-   - location: string
-   - issue: string (e.g., "broken door", "leaking tap")
-   - priority: "low" | "medium" | "high"
+type: "substitution" - teacher is absent
+  - teacher_name (string)
+  - day (string)
 
-4. it_support (Tech/IT Issues)
-   - location: string
-   - device: string (e.g., "projector", "Wi-Fi", "laptop")
-   - issue: string
-   - priority: "medium" | "high"
+type: "maintenance" - physical repair needed
+  - location (string): room or place
+  - issue (string): what is broken
+  - priority: "low" | "medium" | "high"
 
-5. logistics (Supply/Moving requests)
-   - location: string
-   - item: string (e.g., "water", "paper", "chairs")
-   - quantity: string
-   - action: "bring" | "remove" | "move"
+type: "it_support" - tech problem
+  - location (string)
+  - device (string): projector, wifi, laptop, etc
+  - issue (string)
+  - priority: "medium" | "high"
 
-6. emergency (Security/Medical/Safety)
-   - location: string
-   - type: "medical" | "security" | "safety"
-   - description: string
-   - priority: "CRITICAL"
+type: "logistics" - supply or moving request
+  - location (string)
+  - item (string): water, chairs, paper, etc
+  - quantity (string)
+  - action: "bring" | "remove" | "move"
 
-7. task (General Administration)
-   - assignee: string
-   - action: string
+type: "emergency" - danger, medical, security
+  - location (string)
+  - description (string)
+  - priority: "CRITICAL"
 
-8. spam (Irrelevant/Greeting)
+type: "task" - general admin task assignment
+  - assignee (string)
+  - action (string)
 
-ADDITIONAL GLOBAL FIELDS (Always include these):
-- sender_role: string (e.g., "Учитель математики", "Завхоз", "Охрана", "Директор") - Infer from text or context.
-- is_important: boolean (True if it's an emergency, serious maintenance issue, or direct order).
+type: "multi_task" - when a message contains MULTIPLE distinct tasks (e.g., from voice notes)
+  - tasks (array of objects): each object must have "type" (like "task" or "maintenance") and its specific fields.
 
-STRATEGY:
-- If someone says "projector broken", it's 'it_support'.
-- If someone says "bring water", it's 'logistics'.
-- If someone says "student fainted", it's 'emergency'.
-- Be smart: Infer location from context if possible.
-- Default priority to 'medium' unless it sounds urgent.
+type: "bureaucracy" - request to draft official documents/orders (Приказ)
+  - document_type (string): e.g., "130-й регламент", "Отстранение", "Приказ №76"
+  - target (string): who it affects (class or person)
+  - reason (string): why it's needed
+
+type: "lenta" - request to auto-balance a Singapore Lenta schedule
+  - target_group (string): e.g., "8-е классы", "3-е классы"
+  - subject (string): e.g., "Английский", "Математика"
+
+type: "spam" - greetings, irrelevant, unknown
+
+ALWAYS ADD THESE GLOBAL FIELDS:
+  - sender_role (string): infer from context e.g. "Math Teacher", "Security", "Director"
+  - is_important (boolean): true for emergency/urgent issues
+
+DETECTION RULES:
+- Class name + numbers → canteen
+- Projector/wifi/laptop broken → it_support
+- Door/tap/window/furniture → maintenance
+- Bring/move/deliver → logistics
+- Fainted/fight/fire/danger → emergency
+- Приказ, документ, регламент → bureaucracy
+- Лента, уровневая группа, перемешать классы → lenta
 """
+
 
 async def extract_with_ai(text: str) -> dict:
     """Extract structured data using Groq Llama-3.3-70b"""
@@ -79,9 +101,49 @@ async def extract_with_ai(text: str) -> dict:
             temperature=0.1,
             response_format={"type": "json_object"}
         )
-        
+
         raw_text = response.choices[0].message.content.strip()
-        return json.loads(raw_text)
+        result = json.loads(raw_text)
+
+        # Safety net: if AI forgot to add 'type' but put it as a key
+        if "type" not in result:
+            for possible_type in ["canteen", "substitution", "maintenance", "it_support", "logistics", "emergency", "task", "bureaucracy", "lenta", "spam"]:
+                if possible_type in result:
+                    nested = result.pop(possible_type)
+                    result["type"] = possible_type
+                    result.update(nested)
+                    break
+            else:
+                result["type"] = result.get("category", "spam")
+
+        return result
+
     except Exception as e:
         logger.error(f"Groq Extraction Error: {e}")
         return {"type": "spam"}
+
+async def transcribe_audio(audio_base64: str, mimetype: str) -> str:
+    """Transcribe base64 audio using Groq Whisper API (whisper-large-v3-turbo)"""
+    try:
+        ext = ".ogg"
+        if "mp4" in mimetype: ext = ".m4a"
+        elif "webm" in mimetype: ext = ".webm"
+        elif "wav" in mimetype: ext = ".wav"
+        
+        audio_data = base64.b64decode(audio_base64)
+        
+        with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as tmp:
+            tmp.write(audio_data)
+            tmp_path = tmp.name
+            
+        with open(tmp_path, "rb") as file:
+            transcription = await client.audio.transcriptions.create(
+              file=(os.path.basename(tmp_path), file.read()),
+              model="whisper-large-v3-turbo"
+            )
+            
+        os.unlink(tmp_path)
+        return transcription.text
+    except Exception as e:
+        logger.error(f"Whisper Transcription Error: {e}")
+        return ""

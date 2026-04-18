@@ -16,8 +16,13 @@ logging.basicConfig(
 logger = logging.getLogger("tg_bridge")
 
 # Конфигурация
-TG_TOKEN = os.getenv("TG_TOKEN", "8642572783:AAHNR5N9QU6gVpo_EcL2c5QmF0N1Kfos6ms")
-BACKEND_URL = "http://127.0.0.1:8001/internal-webhook"
+TG_TOKEN = os.getenv("TG_TOKEN")
+INTERNAL_SECRET = os.getenv("INTERNAL_SECRET_TOKEN")
+BACKEND_URL = os.getenv("BACKEND_URL", "http://127.0.0.1:8001/internal-webhook")
+
+if not TG_TOKEN:
+    logger.critical("❌ MISSING TG_TOKEN IN .ENV!")
+    exit(1)
 
 # Senior Note: Using Async TeleBot for better performance
 from telebot.async_telebot import AsyncTeleBot
@@ -50,8 +55,9 @@ async def handle_all_messages(message):
     
     try:
         logger.info(f"Forwarding TG message from {payload['user_name']}")
+        headers = {"X-Internal-Token": INTERNAL_SECRET}
         async with httpx.AsyncClient() as client:
-            response = await client.post(BACKEND_URL, json=payload, timeout=10.0)
+            response = await client.post(BACKEND_URL, json=payload, headers=headers, timeout=10.0)
             
             if response.status_code != 200:
                 logger.error(f"Backend error: {response.status_code}")
