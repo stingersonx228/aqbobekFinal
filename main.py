@@ -16,7 +16,7 @@ import re
 load_dotenv()
 
 from src.database import engine, Base, get_db, AsyncSessionLocal
-from src.models import IncidentRecord, CanteenRecord, TaskRecord, ServiceRequest
+from src.models import IncidentRecord, CanteenRecord, TaskRecord, ServiceRequest, ChatMessage
 from src.schemas import NutritionReportResponse, AbsentDetails, IncidentsResponse, IncidentDetail, TasksResponse, TaskDetail
 from src.ai_service import extract_with_ai
 from src.whatsapp_service import send_whatsapp_message
@@ -96,11 +96,24 @@ async def get_nutrition_today(db: AsyncSession = Depends(get_db)):
         "rawMessagesParsed": row.messages_count or 0
     }
 
-@app.get("/api/v1/incidents/active")
-async def get_active_incidents(db: AsyncSession = Depends(get_db)):
-    result = await db.execute(select(IncidentRecord).order_by(IncidentRecord.created_at.desc()))
-    incidents = result.scalars().all()
-    return {"incidents": [inc.issue for inc in incidents]}
+@app.get("/api/v1/messages")
+async def get_chat_messages(db: AsyncSession = Depends(get_db)):
+    """API for the 'Chat Summary' section on the dashboard"""
+    result = await db.execute(select(ChatMessage).order_by(ChatMessage.timestamp.desc()).limit(50))
+    messages = result.scalars().all()
+    return {
+        "messages": [
+            {
+                "id": m.id,
+                "sender": m.sender_name,
+                "role": m.sender_role,
+                "content": m.message,
+                "platform": m.platform,
+                "isImportant": m.is_important,
+                "timestamp": m.timestamp.isoformat()
+            } for m in messages
+        ]
+    }
 
 @app.get("/api/v1/schedule/substitution")
 async def get_latest_substitution(teacher: str, day: str = "Дүйсенбі"):
@@ -150,6 +163,27 @@ async def process_whatsapp_message(message_data: dict):
         broadcast_event = None
 
         async with AsyncSessionLocal() as db:
+            # SAVE RAW MESSAGE FOR CHAT SUMMARY (Vibe Coder Requirement)
+            new_msg = ChatMessage(
+                sender_name=message_data.get("user_name", from_number),
+                sender_role=parsed_data.get("sender_role", "Staff"),
+                message=text_body,
+                platform=message_data.get("platform", "whatsapp"),
+                is_important=parsed_data.get("is_important", False)
+            )
+            db.add(new_msg)
+            await db.commit()
+            
+            # Broadcast the new message for real-time frontend update
+            await manager.broadcast({
+                "type": "NEW_MESSAGE",
+                "data": {
+                    "sender": new_msg.sender_name,
+                    "role": new_msg.sender_role,
+                    "content": new_msg.message,
+                    "isImportant": new_msg.is_important
+                }
+            })
             if data_type in ["it_support", "maintenance", "logistics", "emergency"]:
                 desc = parsed_data.get("issue") or parsed_data.get("description") or parsed_data.get("item")
                 priority = parsed_data.get("priority", "medium")

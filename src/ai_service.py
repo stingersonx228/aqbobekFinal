@@ -55,6 +55,10 @@ CATEGORIES & FIELDS:
 
 8. spam (Irrelevant/Greeting)
 
+ADDITIONAL GLOBAL FIELDS (Always include these):
+- sender_role: string (e.g., "Учитель математики", "Завхоз", "Охрана", "Директор") - Infer from text or context.
+- is_important: boolean (True if it's an emergency, serious maintenance issue, or direct order).
+
 STRATEGY:
 - If someone says "projector broken", it's 'it_support'.
 - If someone says "bring water", it's 'logistics'.

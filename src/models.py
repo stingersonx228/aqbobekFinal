@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, DateTime, ForeignKey
+from sqlalchemy import Column, Integer, String, DateTime, ForeignKey, Boolean
 from sqlalchemy.sql import func
 from .database import Base
 
@@ -40,3 +40,14 @@ class ServiceRequest(Base):
     priority = Column(String, default="medium")
     status = Column(String, default="open")
     created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+class ChatMessage(Base):
+    """Table for the 'Chat Summary' section on the dashboard"""
+    __tablename__ = "chat_messages"
+    id = Column(Integer, primary_key=True, index=True)
+    sender_name = Column(String)
+    sender_role = Column(String) # AI determined
+    message = Column(String)
+    platform = Column(String) # telegram / whatsapp
+    is_important = Column(Boolean, default=False)
+    timestamp = Column(DateTime(timezone=True), server_default=func.now())
